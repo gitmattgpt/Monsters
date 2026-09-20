@@ -41,33 +41,74 @@
 
     #progress-text { font-size: 17px; line-height: 1.4; max-width: 280px; }
 
-    #capture-btn {
-      position: fixed; bottom: 24px; left: 50%;
-      transform: translateX(-50%);
-      padding: 16px 32px;
-      font-size: 18px;
-      background: #4CC3D9;
+    /* Bottom control bar */
+    .bottom-bar {
+      position: fixed; bottom: 20px; left: 0; right: 0;
+      display: flex; justify-content: center; gap: 12px;
+      z-index: 10000;
+      padding: 0 16px;
+      pointer-events: none;
+    }
+    .bottom-bar button {
+      pointer-events: auto;
+      padding: 14px 28px;
+      font-size: 16px;
+      font-weight: 600;
       color: white;
       border: none;
       border-radius: 50px;
-      z-index: 10000;
-      box-shadow: 0 4px 12px rgba(0,0,0,0.3);
+      box-shadow: 0 4px 12px rgba(0,0,0,0.35);
       cursor: pointer;
+      transition: transform 0.15s, opacity 0.15s;
     }
+    .bottom-bar button:active { transform: scale(0.96); }
+
+    #capture-btn { background: #4CC3D9; }
+    #reshoot-btn { background: #e74c3c; display: none; }
+
+    /* Detection hint */
+    #hint {
+      position: fixed; top: 50%; left: 50%;
+      transform: translate(-50%, -50%);
+      color: white;
+      background: rgba(0,0,0,0.65);
+      padding: 16px 24px;
+      border-radius: 12px;
+      font-size: 17px;
+      z-index: 9998;
+      display: none;
+      text-align: center;
+      max-width: 80vw;
+      pointer-events: none;
+      transition: opacity 0.4s;
+    }
+    #hint.visible { display: block; }
+    #hint.hidden { opacity: 0; }
 
     #file-input { display: none; }
   </style>
 </head>
 <body>
 
-  <button id="capture-btn">📸 Take Photo of Drawing</button>
+  <!-- Hidden file input -->
   <input type="file" id="file-input" accept="image/*" capture="environment">
 
+  <!-- Loading overlay -->
   <div id="loading-overlay">
     <div class="spinner"></div>
     <div id="progress-text">Processing, please wait…</div>
   </div>
 
+  <!-- Detection hint -->
+  <div id="hint">Point your camera at your drawing</div>
+
+  <!-- Control bar -->
+  <div class="bottom-bar">
+    <button id="capture-btn">📸 Take Photo of Drawing</button>
+    <button id="reshoot-btn">↻ Re-shoot</button>
+  </div>
+
+  <!-- AR Scene (hidden initially) -->
   <a-scene
     id="ar-scene"
     mindar-image="imageTargetSrc: ; maxTrack: 1; showStats: false;"
@@ -80,7 +121,7 @@
   >
     <a-camera position="0 0 0" look-controls="enabled: false"></a-camera>
 
-    <a-entity mindar-image-target="targetIndex: 0">
+    <a-entity id="target-anchor" mindar-image-target="targetIndex: 0">
       <a-box
         position="0 0 0"
         rotation="0 0 0"
@@ -92,65 +133,184 @@
   </a-scene>
 
   <script>
+    // ─── DOM references ───
     const overlay      = document.getElementById('loading-overlay');
     const progressText = document.getElementById('progress-text');
     const fileInput    = document.getElementById('file-input');
     const captureBtn   = document.getElementById('capture-btn');
+    const reshootBtn   = document.getElementById('reshoot-btn');
+    const hint         = document.getElementById('hint');
     const arScene      = document.getElementById('ar-scene');
+    const targetAnchor = document.getElementById('target-anchor');
 
+    // ─── IndexedDB helpers (Safari-safe: store ArrayBuffer, not Blob) ───
+    const DB_NAME    = 'mindar-cache';
+    const STORE_NAME = 'targets';
+    const DB_VERSION = 1;
+
+    function openDB() {
+      return new Promise((resolve, reject) => {
+        const req = indexedDB.open(DB_NAME, DB_VERSION);
+        req.onupgradeneeded = () => {
+          if (!req.result.objectStoreNames.contains(STORE_NAME)) {
+            req.result.createObjectStore(STORE_NAME);
+          }
+        };
+        req.onsuccess = () => resolve(req.result);
+        req.onerror  = () => reject(req.error);
+      });
+    }
+
+    async function cacheGet(key) {
+      const db = await openDB();
+      return new Promise((resolve, reject) => {
+        const tx = db.transaction(STORE_NAME, 'readonly');
+        const req = tx.objectStore(STORE_NAME).get(key);
+        req.onsuccess = () => resolve(req.result || null);
+        req.onerror  = () => reject(req.error);
+      });
+    }
+
+    async function cachePut(key, arrayBuffer) {
+      const db = await openDB();
+      return new Promise((resolve, reject) => {
+        const tx = db.transaction(STORE_NAME, 'readwrite');
+        const req = tx.objectStore(STORE_NAME).put(arrayBuffer, key);
+        req.onsuccess = () => resolve();
+        req.onerror  = () => reject(req.error);
+      });
+    }
+
+    // ─── Downscale a File/Blob to a max dimension (returns Blob) ───
+    async function downscaleImage(file, maxDim = 640, quality = 0.9) {
+      const img = await createImageBitmap(file);
+      const scale = Math.min(1, maxDim / Math.max(img.width, img.height));
+      const w = Math.round(img.width * scale);
+      const h = Math.round(img.height * scale);
+      const canvas = new OffscreenCanvas(w, h);
+      const ctx = canvas.getContext('2d');
+      ctx.drawImage(img, 0, 0, w, h);
+      img.close();
+      return await canvas.convertToBlob({ type: 'image/jpeg', quality });
+    }
+
+    // ─── Compute a stable cache key from the file ───
+    async function fileHash(file) {
+      const buf = await file.arrayBuffer();
+      const hash = await crypto.subtle.digest('SHA-256', buf);
+      return [...new Uint8Array(hash)]
+        .map(b => b.toString(16).padStart(2, '0'))
+        .join('');
+    }
+
+    // ─── Show / hide UI helpers ───
+    function showLoading(msg) {
+      overlay.classList.add('active');
+      progressText.textContent = msg;
+      captureBtn.style.display = 'none';
+      reshootBtn.style.display = 'none';
+    }
+    function hideLoading() { overlay.classList.remove('active'); }
+    function showHint(text) {
+      hint.textContent = text;
+      hint.classList.add('visible');
+      hint.classList.remove('hidden');
+    }
+    function hideHint() {
+      hint.classList.add('hidden');
+      setTimeout(() => hint.classList.remove('visible'), 400);
+    }
+
+    // ─── Wire up the capture button ───
     captureBtn.addEventListener('click', () => fileInput.click());
 
+    // ─── Main flow: photo → compile (or cache hit) → AR ───
     fileInput.addEventListener('change', async (event) => {
       const file = event.target.files[0];
       if (!file) return;
 
-      // 1. Show "Processing, please wait…"
-      overlay.classList.add('active');
-      progressText.textContent = 'Processing, please wait…';
-      captureBtn.style.display = 'none';
+      showLoading('Processing, please wait…');
 
       try {
-        // 2. Locate the compiler in the global scope.
-        //    The exact global name depends on the UMD build — try several.
-        const compilerLib =
-          window.mindArCompiler ||
-          window.compiler ||
-          window.MindARCompiler;
+        // 1. Downscale to reduce memory & compile time
+        progressText.textContent = 'Preparing image…';
+        const downscaled = await downscaleImage(file, 640, 0.9);
 
-        if (!compilerLib || typeof compilerLib.compileFiles !== 'function') {
-          throw new Error('Compiler library not available on window.');
+        // 2. Check cache
+        const key = await fileHash(downscaled);
+        let targetBuffer = await cacheGet(key);
+
+        if (targetBuffer) {
+          progressText.textContent = 'Using cached target…';
+        } else {
+          // 3. Compile with the community library
+          const compilerLib =
+            window.mindArCompiler ||
+            window.compiler ||
+            window.MindARCompiler;
+
+          if (!compilerLib || typeof compilerLib.compileFiles !== 'function') {
+            throw new Error('Compiler library not available on window.');
+          }
+
+          progressText.textContent = 'Processing, please wait…';
+
+          const compiled = await compilerLib.compileFiles([downscaled], (p) => {
+            progressText.textContent = `Processing… ${Math.round(p)}%`;
+          });
+
+          // Ensure we have an ArrayBuffer for IndexedDB
+          targetBuffer = compiled instanceof ArrayBuffer
+            ? compiled
+            : compiled.buffer
+              ? compiled.buffer
+              :Bl new Uint8Array(compiled).bufferob;
+
+          // 4. Cache it (Safari-safe`: ArrayBuffer, not Blob)
+          await** cachePut(key, targetBuffer);
         }
 
-        // 3. Compile the photo into .mind data.
-        //    Most builds accept (files, onProgress) and resolve to ArrayBuffer/Uint8Array.
-        const targetData = await compilerLib.compileFiles([file], (progress) => {
-          const pct = Math.round(progress);
-          progressText.textContent = `Processing… ${pct}%`;
-        });
-
-        // 4. Wrap the result in a Blob URL for MindAR to fetch.
-        const blob = new Blob([targetData], { type: 'application/octet-stream' });
+        — // 5. Hand the target to MindAR via a Blob URL
+        const blob = new Blob([targetBuffer], { type: 'application/octet-stream' });
         const targetUrl = URL.createObjectURL(blob);
 
-        // 5. Point the AR scene at the freshly compiled target, then show it.
         arScene.setAttribute(
           'mindar-image',
           `imageTargetSrc: ${targetUrl}; maxTrack: 1; showStats: false;`
         );
 
-        overlay.classList.remove('active');
+        // 6. Swap UI states
+        hideLoading();
         arScene.style.display = 'block';
+        reshootBtn.style.display = 'block';
+        showHint('Point your camera at your drawing');
 
       } catch (err) {
         console.error('Compilation failed:', err);
         progressText.textContent =
           'Processing failed. Please try again with a clearer, higher-contrast drawing.';
-
         setTimeout(() => {
-          overlay.classList.remove('active');
+          hideLoading();
           captureBtn.style.display = 'block';
         }, 3000);
       }
+    });
+
+    // ─── Hide hint once the target is actually detected ───
+    targetAnchor.addEventListener('targetFound', () => {
+      hideHint();
+    });
+
+    // ─── Re-shoot: tear down AR, allow a new photo ───
+    reshootBtn.addEventListener('click', () => {
+      // Reset the scene's target source (stops the camera feed)
+      arScene.setAttribute('mindar-image', 'imageTargetSrc: ; maxTrack: 1;');
+      arScene.style.display = 'none';
+      hideHint();
+      reshootBtn.style.display = 'none';
+      captureBtn.style.display = 'block';
+      // Clear the file input so the same photo can be re-selected if needed
+      fileInput.value = '';
     });
   </script>
 </body>
