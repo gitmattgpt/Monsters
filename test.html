@@ -1,0 +1,19 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+</head>
+<body>
+  <button id="btn" style="padding:20px;font-size:20px;">📸 Test Camera</button>
+  <input type="file" id="inp" accept="image/*" capture="environment"
+         style="position:absolute;left:-9999px;opacity:0;width:1px;height:1px;">
+  <script>
+    document.getElementById('btn').addEventListener('click', () => {
+      document.getElementById('inp').click();
+    });
+    document.getElementById('inp').addEventListener('change', (e) => {
+      alert('Got file: ' + e.target.files[0].name);
+    });
+  </script>
+</body>
+</html>
