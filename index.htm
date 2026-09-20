@@ -1,0 +1,157 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no" />
+  <title>Drawing AR — Local Compiler</title>
+
+  <!-- Community MindAR compiler (browser-side) -->
+  <script src="https://cdn.jsdelivr.net/npm/@maherboughdiri/mind-ar-compiler@1.0.1/dist/mind-ar-compiler.min.js"></script>
+  <!-- A-Frame + MindAR runtime -->
+  <script src="https://aframe.io/releases/1.8.0/aframe.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/mind-ar@1.2.2/dist/mindar-image-aframe.prod.js"></script>
+
+  <style>
+    body { margin: 0; overflow: hidden; font-family: -apple-system, sans-serif; }
+
+    /* Loading overlay */
+    #loading-overlay {
+      position: fixed; inset: 0;
+      background: rgba(0, 0, 0, 0.85);
+      color: white;
+      z-index: 9999;
+      display: none;
+      flex-direction: column;
+      justify-content: center;
+      align-items: center;
+      text-align: center;
+      padding: 24px;
+    }
+    #loading-overlay.active { display: flex; }
+
+    .spinner {
+      border: 4px solid rgba(255, 255, 255, 0.3);
+      border-top: 4px solid #fff;
+      border-radius: 50%;
+      width: 44px; height: 44px;
+      animation: spin 1s linear infinite;
+      margin-bottom: 20px;
+    }
+    @keyframes spin { to { transform: rotate(360deg); } }
+
+    #progress-text { font-size: 17px; line-height: 1.4; max-width: 280px; }
+
+    #capture-btn {
+      position: fixed; bottom: 24px; left: 50%;
+      transform: translateX(-50%);
+      padding: 16px 32px;
+      font-size: 18px;
+      background: #4CC3D9;
+      color: white;
+      border: none;
+      border-radius: 50px;
+      z-index: 10000;
+      box-shadow: 0 4px 12px rgba(0,0,0,0.3);
+      cursor: pointer;
+    }
+
+    #file-input { display: none; }
+  </style>
+</head>
+<body>
+
+  <button id="capture-btn">📸 Take Photo of Drawing</button>
+  <input type="file" id="file-input" accept="image/*" capture="environment">
+
+  <div id="loading-overlay">
+    <div class="spinner"></div>
+    <div id="progress-text">Processing, please wait…</div>
+  </div>
+
+  <a-scene
+    id="ar-scene"
+    mindar-image="imageTargetSrc: ; maxTrack: 1; showStats: false;"
+    color-space="sRGB"
+    renderer="colorManagement: true; physicallyCorrectLights: true"
+    vr-mode-ui="enabled: false"
+    device-orientation-permission-ui="enabled: false"
+    embedded
+    style="display: none;"
+  >
+    <a-camera position="0 0 0" look-controls="enabled: false"></a-camera>
+
+    <a-entity mindar-image-target="targetIndex: 0">
+      <a-box
+        position="0 0 0"
+        rotation="0 0 0"
+        width="0.5" height="0.5" depth="0.5"
+        color="#4CC3D9"
+        animation="property: rotation; to: 0 360 0; loop: true; dur: 4000; easing: linear;"
+      ></a-box>
+    </a-entity>
+  </a-scene>
+
+  <script>
+    const overlay      = document.getElementById('loading-overlay');
+    const progressText = document.getElementById('progress-text');
+    const fileInput    = document.getElementById('file-input');
+    const captureBtn   = document.getElementById('capture-btn');
+    const arScene      = document.getElementById('ar-scene');
+
+    captureBtn.addEventListener('click', () => fileInput.click());
+
+    fileInput.addEventListener('change', async (event) => {
+      const file = event.target.files[0];
+      if (!file) return;
+
+      // 1. Show "Processing, please wait…"
+      overlay.classList.add('active');
+      progressText.textContent = 'Processing, please wait…';
+      captureBtn.style.display = 'none';
+
+      try {
+        // 2. Locate the compiler in the global scope.
+        //    The exact global name depends on the UMD build — try several.
+        const compilerLib =
+          window.mindArCompiler ||
+          window.compiler ||
+          window.MindARCompiler;
+
+        if (!compilerLib || typeof compilerLib.compileFiles !== 'function') {
+          throw new Error('Compiler library not available on window.');
+        }
+
+        // 3. Compile the photo into .mind data.
+        //    Most builds accept (files, onProgress) and resolve to ArrayBuffer/Uint8Array.
+        const targetData = await compilerLib.compileFiles([file], (progress) => {
+          const pct = Math.round(progress);
+          progressText.textContent = `Processing… ${pct}%`;
+        });
+
+        // 4. Wrap the result in a Blob URL for MindAR to fetch.
+        const blob = new Blob([targetData], { type: 'application/octet-stream' });
+        const targetUrl = URL.createObjectURL(blob);
+
+        // 5. Point the AR scene at the freshly compiled target, then show it.
+        arScene.setAttribute(
+          'mindar-image',
+          `imageTargetSrc: ${targetUrl}; maxTrack: 1; showStats: false;`
+        );
+
+        overlay.classList.remove('active');
+        arScene.style.display = 'block';
+
+      } catch (err) {
+        console.error('Compilation failed:', err);
+        progressText.textContent =
+          'Processing failed. Please try again with a clearer, higher-contrast drawing.';
+
+        setTimeout(() => {
+          overlay.classList.remove('active');
+          captureBtn.style.display = 'block';
+        }, 3000);
+      }
+    });
+  </script>
+</body>
+</html>
